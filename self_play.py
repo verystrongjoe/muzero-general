@@ -1,23 +1,27 @@
 import copy
+import os
 import math
 import time
-
+from games.base_classes import MuZeroConfigBase
+from torch.utils.tensorboard import SummaryWriter
 import numpy
-import ray
 import torch
 
 import models
 
 
-@ray.remote
 class SelfPlay:
     """
     Class which run in a dedicated thread to play games and save them to the replay-buffer.
     """
 
-    def __init__(self, initial_weights, game, config):
-        self.config = config
+    def __init__(self, initial_weights, game, config, test=False, idx=-1, render=False):
+        self.config: MuZeroConfigBase = config
         self.game = game
+        self.idx = idx
+        self.episode = 0
+        self.render = render
+        self.writer = SummaryWriter(self.config.results_path / f"self_play_{idx}")
 
         # Initialize the network
         self.model = models.MuZeroNetwork(
@@ -30,39 +34,47 @@ class SelfPlay:
         self.model.to(torch.device("cpu"))
         self.model.eval()
 
-    def continuous_self_play(self, shared_storage, replay_buffer, test_mode=False):
+        self.continuous_self_play(test)
+
+    def continuous_self_play(self, test_mode=False):
         while True:
-            self.model.set_weights(
-                copy.deepcopy(ray.get(shared_storage.get_weights.remote()))
-            )
+            if self.config.v_self_play_count.value > 0:
+                # Update the model if the trianer is running
+                self.model.set_weights(self.config.q_weights.get())
 
             # Take the best action (no exploration) in test mode
             temperature = (
                 0
                 if test_mode
                 else self.config.visit_softmax_temperature_fn(
-                    trained_steps=ray.get(shared_storage.get_infos.remote())[
-                        "training_step"
-                    ]
+                    trained_steps=self.config.v_training_step.value
                 )
             )
             game_history = self.play_game(temperature, False)
 
             # Save to the shared storage
+            score = sum(game_history.rewards)
+            self.writer.add_scalars(
+                f"1.Total reward/{'test' if test_mode else 'train'}",
+                {f"env_{self.idx}": score},
+                global_step=self.episode,
+            )
+            self.episode += 1
             if test_mode:
-                shared_storage.set_infos.remote(
-                    "total_reward", sum(game_history.rewards)
-                )
+                self.config.v_total_reward.value = int(score)
+
             if not test_mode:
-                replay_buffer.save_game.remote(game_history)
+                self.config.q_save_game.put(game_history)
 
             if not test_mode and self.config.self_play_delay:
                 time.sleep(self.config.self_play_delay)
 
-    def play_game(self, temperature, render):
+    def play_game(self, temperature, render: bool = None):
         """
         Play one game with actions based on the Monte Carlo tree search at each moves.
         """
+        if render is None:
+            render = self.render
         game_history = GameHistory()
         observation = self.game.reset()
         game_history.observation_history.append(observation)

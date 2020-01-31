@@ -1,13 +1,13 @@
 import time
-
+from games.base_classes import MuZeroConfigBase
+from threading import Thread
+from torch.utils.tensorboard import SummaryWriter
 import numpy
-import ray
 import torch
 
 import models
 
 
-@ray.remote
 class Trainer:
     """
     Class which run in a dedicated thread to train a neural network and save it
@@ -15,8 +15,9 @@ class Trainer:
     """
 
     def __init__(self, initial_weights, config):
-        self.config = config
+        self.config: MuZeroConfigBase = config
         self.training_step = 0
+        self.writer = SummaryWriter(self.config.results_path / "trainer")
 
         # Initialize the network
         self.model = models.MuZeroNetwork(
@@ -36,26 +37,49 @@ class Trainer:
             weight_decay=self.config.weight_decay,
         )
 
-    def continuous_update_weights(self, replay_buffer, shared_storage_worker):
+        def async_put_weights():
+            last_idx = None
+            while True:
+                if self.config.q_weights.empty():
+                    if self.training_step != last_idx:
+                        weights = self.model.get_weights()
+                        last_idx = self.training_step
+                    self.config.q_weights.put(weights)
+                else:
+                    time.sleep(0.1)
+
+        Thread(target=async_put_weights).start()
+        self.continuous_update_weights()
+
+    def continuous_update_weights(self):
         # Wait for the replay buffer to be filled
-        while ray.get(replay_buffer.get_self_play_count.remote()) < 1:
-            time.sleep(0.1)
+        while self.config.v_self_play_count.value < 1:
+            time.sleep(1)
 
         # Training loop
         while True:
-            batch = ray.get(replay_buffer.get_batch.remote())
+            batch = self.config.q_replay_batch.get()
             total_loss, value_loss, reward_loss, policy_loss = self.update_weights(
                 batch
             )
 
             # Save to the shared storage
             if self.training_step % self.config.checkpoint_interval == 0:
-                shared_storage_worker.set_weights.remote(self.model.get_weights())
-            shared_storage_worker.set_infos.remote("training_step", self.training_step)
-            shared_storage_worker.set_infos.remote("total_loss", total_loss)
-            shared_storage_worker.set_infos.remote("value_loss", value_loss)
-            shared_storage_worker.set_infos.remote("reward_loss", reward_loss)
-            shared_storage_worker.set_infos.remote("policy_loss", policy_loss)
+                self.config.q_weights.put(self.model.get_weights())
+            self.config.v_training_step.value = self.training_step
+            self.writer.add_scalar(
+                "2.Workers/Training steps", self.training_step, self.training_step
+            )
+            self.writer.add_scalar(
+                "3.Loss/1.Total loss", total_loss, self.training_step
+            )
+            self.writer.add_scalar("3.Loss/Value loss", value_loss, self.training_step)
+            self.writer.add_scalar(
+                "3.Loss/Reward loss", reward_loss, self.training_step
+            )
+            self.writer.add_scalar(
+                "3.Loss/Policy loss", policy_loss, self.training_step
+            )
 
             if self.config.training_delay:
                 time.sleep(self.config.training_delay)

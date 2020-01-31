@@ -1,12 +1,19 @@
 import gym
 import torch
-from .base_classes import MuZeroConfigBase
+from torch import multiprocessing as mp
 
 
-class MuZeroConfig(MuZeroConfigBase):
+class MuZeroConfigBase:
     def __init__(self):
-        super(MuZeroConfig, self).__init__()
         self.seed = 0  # Seed for numpy, torch and the game
+
+        ### Inter Process Communication
+        self.v_self_play_count = mp.Value("i", 0)
+        self.v_training_step = mp.Value("i", 0)
+        self.v_total_reward = mp.Value("i", 0)
+        self.q_save_game = mp.Queue()
+        self.q_replay_batch = mp.Queue(maxsize=10)
+        self.q_weights = mp.Queue(maxsize=1)
 
         ### Game
         self.observation_shape = 4  # Dimensions of the game observation
@@ -80,58 +87,3 @@ class MuZeroConfig(MuZeroConfigBase):
             return 0.5
         else:
             return 0.25
-
-
-class Game:
-    """
-    Game wrapper.
-    """
-
-    def __init__(self, seed=None):
-        self.env = gym.make("CartPole-v1")
-        if seed is not None:
-            self.env.seed(seed)
-
-    def step(self, action):
-        """
-        Apply action to the game.
-        
-        Args:
-            action : action of the action_space to take.
-
-        Returns:
-            The new observation, the reward and a boolean if the game has ended.
-        """
-        observation, reward, done, _ = self.env.step(action)
-        return observation, reward, done
-
-    def to_play(self):
-        """
-        Return the current player.
-
-        Returns:
-            The current player, it should be an element of the players list in the config. 
-        """
-        return 0
-
-    def reset(self):
-        """
-        Reset the game for a new game.
-        
-        Returns:
-            Initial observation of the game.
-        """
-        return self.env.reset()
-
-    def close(self):
-        """
-        Properly close the game.
-        """
-        self.env.close()
-
-    def render(self):
-        """
-        Display the game observation.
-        """
-        self.env.render()
-        input("Press enter to take a step ")

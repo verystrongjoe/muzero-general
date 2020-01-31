@@ -1,6 +1,5 @@
 numpy
 torch
-ray
 gym
 box2d-py
 psutil

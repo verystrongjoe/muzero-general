@@ -2,17 +2,23 @@ import copy
 import importlib
 import os
 import time
-
+from pathlib import Path
 import numpy
-import ray
 import torch
+from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 
 import models
 import replay_buffer
 import self_play
-import shared_storage
 import trainer
+from games.base_classes import MuZeroConfigBase
+
+
+def time_stamp_str():
+    import datetime
+
+    return datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
 
 
 class MuZero:
@@ -35,7 +41,7 @@ class MuZero:
         # Load the game and the config from the module with the game name
         try:
             game_module = importlib.import_module("games." + self.game_name)
-            self.config = game_module.MuZeroConfig()
+            self.config: MuZeroConfigBase = game_module.MuZeroConfig()
             self.Game = game_module.Game
         except Exception as err:
             print(
@@ -58,104 +64,81 @@ class MuZero:
             self.config.encoding_size,
             self.config.hidden_size,
         ).get_weights()
+        self.config.results_path = (
+            Path(self.config.results_path)
+            / (self.game_name + "_summary")
+            / time_stamp_str()
+        )
 
     def train(self):
-        ray.init()
-        writer = SummaryWriter(
-            os.path.join(self.config.results_path, self.game_name + "_summary")
-        )
+        writer = SummaryWriter(self.config.results_path)
 
         # Initialize workers
-        training_worker = trainer.Trainer.options(
-            num_gpus=1 if "cuda" in self.config.training_device else 0
-        ).remote(copy.deepcopy(self.muzero_weights), self.config)
-        shared_storage_worker = shared_storage.SharedStorage.remote(
-            copy.deepcopy(self.muzero_weights), self.game_name, self.config,
+        training_worker = mp.Process(
+            target=trainer.Trainer,
+            args=(copy.deepcopy(self.muzero_weights), self.config),
         )
-        replay_buffer_worker = replay_buffer.ReplayBuffer.remote(self.config)
+        training_worker.start()
+        replay_buffer_worker = mp.Process(
+            target=replay_buffer.ReplayBuffer, args=(self.config,)
+        )
+        replay_buffer_worker.start()
         self_play_workers = [
-            self_play.SelfPlay.remote(
-                copy.deepcopy(self.muzero_weights),
-                self.Game(self.config.seed + seed),
-                self.config,
+            mp.Process(
+                target=self_play.SelfPlay,
+                args=(
+                    copy.deepcopy(self.muzero_weights),
+                    self.Game(self.config.seed + seed),
+                    self.config,
+                ),
+                kwargs={"idx": seed, "test": False},
             )
             for seed in range(self.config.num_actors)
         ]
-        test_worker = self_play.SelfPlay.remote(
-            copy.deepcopy(self.muzero_weights), self.Game(), self.config
+        [p.start() for p in self_play_workers]
+        test_worker = mp.Process(
+            target=self_play.SelfPlay,
+            args=(copy.deepcopy(self.muzero_weights), self.Game(), self.config),
+            kwargs={"test": True},
         )
-
-        # Launch workers
-        [
-            self_play_worker.continuous_self_play.remote(
-                shared_storage_worker, replay_buffer_worker
-            )
-            for self_play_worker in self_play_workers
-        ]
-        test_worker.continuous_self_play.remote(shared_storage_worker, None, True)
-        training_worker.continuous_update_weights.remote(
-            replay_buffer_worker, shared_storage_worker
-        )
+        test_worker.start()
 
         # Loop for monitoring in real time the workers
         print(
             "\nTraining...\nRun tensorboard --logdir ./ and go to http://localhost:6006/ to see in real time the training performance.\n"
         )
-        counter = 0
-        infos = ray.get(shared_storage_worker.get_infos.remote())
-        try:
-            while infos["training_step"] < self.config.training_steps:
-                # Get and save real time performance
-                infos = ray.get(shared_storage_worker.get_infos.remote())
-                writer.add_scalar(
-                    "1.Total reward/Total reward", infos["total_reward"], counter
-                )
-                writer.add_scalar(
-                    "2.Workers/Self played games",
-                    ray.get(replay_buffer_worker.get_self_play_count.remote()),
-                    counter,
-                )
-                writer.add_scalar(
-                    "2.Workers/Training steps", infos["training_step"], counter
-                )
-                writer.add_scalar("3.Loss/1.Total loss", infos["total_loss"], counter)
-                writer.add_scalar("3.Loss/Value loss", infos["value_loss"], counter)
-                writer.add_scalar("3.Loss/Reward loss", infos["reward_loss"], counter)
-                writer.add_scalar("3.Loss/Policy loss", infos["policy_loss"], counter)
-                print(
-                    "Last test reward: {0:.2f}. Training step: {1}/{2}. Played games: {3}. Loss: {4:.2f}".format(
-                        infos["total_reward"],
-                        infos["training_step"],
-                        self.config.training_steps,
-                        ray.get(replay_buffer_worker.get_self_play_count.remote()),
-                        infos["total_loss"],
-                    ),
-                    end="\r",
-                )
-                counter += 1
-                time.sleep(3)
-        except KeyboardInterrupt:
-            # Comment the line below to be able to stop the training but keep running
-            raise KeyboardInterrupt
-            pass
-        self.muzero_weights = ray.get(shared_storage_worker.get_weights.remote())
-        ray.shutdown()
+        self.config: MuZeroConfigBase
+        while self.config.v_training_step.value < self.config.training_steps:
+            time.sleep(10)
+
+        print("Training steps set in conf exceeded. Killing all processes")
+        training_worker.kill()
+        replay_buffer_worker.kill()
+        [worker.kill() for worker in self_play_workers]
+        test_worker.kill()
 
     def test(self, render=True):
         """
         Test the model in a dedicated thread.
         """
         print("\nTesting...")
-        ray.init()
-        self_play_workers = self_play.SelfPlay.remote(
-            copy.deepcopy(self.muzero_weights), self.Game(), self.config
-        )
-        test_rewards = []
-        for _ in range(self.config.test_episodes):
-            history = ray.get(self_play_workers.play_game.remote(0, render))
-            test_rewards.append(sum(history.rewards))
-        ray.shutdown()
-        return test_rewards
+        test_worker = mp.Process(
+            target=self_play.SelfPlay,
+            args=(copy.deepcopy(self.muzero_weights), self.Game(), self.config),
+            kwargs={"test": True, "idx": 0, "render": True},
+        ).start()
+
+        print("sleeping. Keyboard interrupt me when ready.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("stopping!")
+
+        # for _ in range(self.config.test_episodes):
+        #     history = ray.get(self_play_workers.play_game.remote(0, render))
+        #     test_rewards.append(sum(history.rewards))
+        # return test_rewards
 
     def load_model(self, path=None):
         if not path:

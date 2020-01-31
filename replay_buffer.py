@@ -1,26 +1,52 @@
 import numpy
-import ray
+from games.base_classes import MuZeroConfigBase
+import threading
+import time
+from torch.utils.tensorboard import SummaryWriter
 
 
-@ray.remote
 class ReplayBuffer:
     """
     Class which run in a dedicated thread to store played games and generate batch.
     """
 
     def __init__(self, config):
-        self.config = config
+        self.config: MuZeroConfigBase = config
         self.buffer = []
-        self.self_play_count = 0
+        self.writer = SummaryWriter(self.config.results_path / "self_play")
+        self.global_step = 0
+
+        def save_gave_listener():
+            while True:
+                game_history = self.config.q_save_game.get()
+                self.save_game(game_history)
+
+        threading.Thread(target=save_gave_listener).start()
+
+        def batch_pusher():
+            while True:
+                if self.config.v_self_play_count.value < 1:
+                    time.sleep(1)
+                else:
+                    batch = self.get_batch()
+                    self.config.q_replay_batch.put(batch)
+
+        threading.Thread(target=batch_pusher).start()
 
     def save_game(self, game_history):
         if len(self.buffer) > self.config.window_size:
             self.buffer.pop(0)
         self.buffer.append(game_history)
-        self.self_play_count += 1
+        self.config.v_self_play_count.value += 1
+        self.writer.add_scalar(
+            "2.Workers/Self played games",
+            self.config.v_self_play_count.value,
+            self.global_step,
+        )
+        self.global_step += 1
 
     def get_self_play_count(self):
-        return self.self_play_count
+        return self.config.v_self_play_count.value
 
     def get_batch(self):
         observation_batch, action_batch, reward_batch, value_batch, policy_batch = (
@@ -57,7 +83,9 @@ def sample_game(buffer):
     """
     # TODO: sample with probability link to the highest difference between real and
     # predicted value (See paper appendix Training)
-    return numpy.random.choice(buffer)
+    batch_size = len(buffer)
+    choice = numpy.random.randint(0, batch_size)
+    return buffer[choice]
 
 
 def sample_position(game_history):
