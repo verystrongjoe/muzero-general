@@ -4,23 +4,20 @@ from threading import Thread
 from torch.utils.tensorboard import SummaryWriter
 import numpy
 import torch
-
 import models
 
 
 class Trainer:
     """
-    Class which run in a dedicated thread to train a neural network and save it
-    in the shared storage.
+    Class which run in a dedicated thread to train a neural network and save it in the shared storage.
     """
-
     def __init__(self, initial_weights, config):
         self.config: MuZeroConfigBase = config
         self.training_step = 0
         self.writer = SummaryWriter(self.config.results_path / "trainer")
 
         # Initialize the network
-        self.model = models.MuZeroNetwork(
+        self.model = models.MuZeroExtendedNetwork(
             self.config.observation_shape,
             len(self.config.action_space),
             self.config.encoding_size,
@@ -111,7 +108,8 @@ class Trainer:
         predictions = [(value, reward, policy_logits)]
         for action_i in range(self.config.num_unroll_steps):
             value, reward, policy_logits, hidden_state = self.model.recurrent_inference(
-                hidden_state, action_batch[:, action_i]
+                # todo : check here! can we set previous_actions with empty list?
+                hidden_state, action_batch[:, action_i], []
             )
             predictions.append((value, reward, policy_logits))
 
@@ -164,13 +162,9 @@ class Trainer:
             param_group["lr"] = lr
 
 
-def loss_function(
-    value, reward, policy_logits, target_value, target_reward, target_policy
-):
+def loss_function(value, reward, policy_logits, target_value, target_reward, target_policy):
     # TODO: paper promotes cross entropy instead of MSE
     value_loss = torch.nn.MSELoss()(value, target_value)
     reward_loss = torch.nn.MSELoss()(reward, target_reward)
-    policy_loss = torch.mean(
-        torch.sum(-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits), 1)
-    )
+    policy_loss = torch.mean(torch.sum(-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits), 1))
     return value_loss, reward_loss, policy_loss

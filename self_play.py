@@ -24,7 +24,7 @@ class SelfPlay:
         self.writer = SummaryWriter(self.config.results_path / f"self_play_{idx}")
 
         # Initialize the network
-        self.model = models.MuZeroNetwork(
+        self.model = models.MuZeroExtendedNetwork(
             self.config.observation_shape,
             len(self.config.action_space),
             self.config.encoding_size,
@@ -79,16 +79,19 @@ class SelfPlay:
         observation = self.game.reset()
         game_history.observation_history.append(observation)
         done = False
+
         with torch.no_grad():
             while not done and len(game_history.action_history) < self.config.max_moves:
+
                 root = MCTS(self.config).run(
                     self.model,
                     observation,
                     self.game.to_play(),
                     True if temperature else False,
+                    self.game
                 )
 
-                action = select_action(root, temperature)
+                action = select_action(root, temperature, self.game)
 
                 observation, reward, done = self.game.step(action)
 
@@ -104,9 +107,9 @@ class SelfPlay:
         return game_history
 
 
-def select_action(node, temperature):
+def select_action(node, temperature, game):
     """
-    Select action according to the vivist count distribution and the temperature.
+    Select action according to the visit count distribution and the temperature.
     The temperature is changed dynamically with the visit_softmax_temperature function 
     in the config.
     """
@@ -121,9 +124,29 @@ def select_action(node, temperature):
         visit_count_distribution = visit_count_distribution / sum(
             visit_count_distribution
         )
+
+        # ----------------------------- added -----------------------------
+        # def softmax(a):
+        #     exp_a = np.exp(a)
+        #     sum_exp_a = np.sum(exp_a)
+        #     y = exp_a / sum_exp_a
+        #
+        #     return y
+
+        import numpy as np
+        visit_count_distribution[game.env.previous_actions] = -100
+
+        odds = np.exp(visit_count_distribution)
+        act_probs = odds / np.sum(odds)
+
         action_pos = numpy.random.choice(
-            len(visit_counts[1]), p=visit_count_distribution
+            len(visit_counts[1]), p=act_probs
         )
+        # ----------------------------- added -----------------------------
+
+        # action_pos = numpy.random.choice(
+        #     len(visit_counts[1]), p=visit_count_distribution
+        # )
 
     if temperature == float("inf"):
         action_pos = numpy.random.choice(len(visit_counts[1]))
@@ -143,7 +166,7 @@ class MCTS:
     def __init__(self, config):
         self.config = config
 
-    def run(self, model, observation, to_play, add_exploration_noise):
+    def run(self, model, observation, to_play, add_exploration_noise, game):
         """
         At the root of the search tree we use the representation function to obtain a
         hidden state given the current observation.
@@ -157,15 +180,19 @@ class MCTS:
             .unsqueeze(0)
             .to(next(model.parameters()).device)
         )
+
+        # initial inference
         _, expected_reward, policy_logits, hidden_state = model.initial_inference(
             observation
         )
+
         root.expand(
             self.config.action_space,
             to_play,
             expected_reward,
             policy_logits,
             hidden_state,
+            game.env.previous_actions
         )
         if add_exploration_noise:
             root.add_exploration_noise(
@@ -180,6 +207,7 @@ class MCTS:
             node = root
             search_path = [node]
 
+            ######## Simulation ##########
             while node.expanded():
                 action, node = self.select_child(node, min_max_stats)
                 last_action = action
@@ -194,16 +222,21 @@ class MCTS:
             # Inside the search tree we use the dynamics function to obtain the next hidden
             # state given an action and the previous hidden state
             parent = search_path[-2]
+
+            ######## Expansion ##########
             value, reward, policy_logits, hidden_state = model.recurrent_inference(
                 parent.hidden_state,
                 torch.tensor([[last_action]]).to(parent.hidden_state.device),
+                game.env.previous_actions
             )
+
             node.expand(
                 self.config.action_space,
                 virtual_to_play,
                 reward,
                 policy_logits,
                 hidden_state,
+                game.env.previous_actions
             )
 
             self.backpropagate(search_path, value.item(), to_play, min_max_stats)
@@ -239,8 +272,7 @@ class MCTS:
 
     def backpropagate(self, search_path, value, to_play, min_max_stats):
         """
-        At the end of a simulation, we propagate the evaluation all the way up the tree
-        to the root.
+        At the end of a simulation, we propagate the evaluation all the way up the tree to the root.
         """
         for node in search_path:
             node.value_sum += value if node.to_play == to_play else -value
@@ -268,18 +300,26 @@ class Node:
             return 0
         return self.value_sum / self.visit_count
 
-    def expand(self, actions, to_play, reward, policy_logits, hidden_state):
+    def expand(self, actions, to_play, reward, policy_logits, hidden_state, prev_actions):
+    # def expand(self, actions, to_play, reward, policy_logits, hidden_state):
         """
-        We expand a node using the value, reward and policy prediction obtained from the
-        neural network.
+        We expand a node using the value, reward and policy prediction obtained from the neural network.
         """
         self.to_play = to_play
         self.reward = reward
         self.hidden_state = hidden_state
+
         policy = {a: math.exp(policy_logits[0][a]) for a in actions}
+
+        for p_a in prev_actions:
+            policy[p_a] = -100
+
         policy_sum = sum(policy.values())
         for action, p in policy.items():
-            self.children[action] = Node(p / policy_sum)
+            node = Node(p / policy_sum)
+            self.children[action] = node
+
+        return action
 
     def add_exploration_noise(self, dirichlet_alpha, exploration_fraction):
         """

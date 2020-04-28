@@ -17,7 +17,6 @@ from games.base_classes import MuZeroConfigBase
 
 def time_stamp_str():
     import datetime
-
     return datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
 
 
@@ -58,12 +57,13 @@ class MuZero:
         torch.manual_seed(self.config.seed)
 
         # Initial weights used to initialize components
-        self.muzero_weights = models.MuZeroNetwork(
+        self.muzero_weights = models.MuZeroExtendedNetwork(
             self.config.observation_shape,
             len(self.config.action_space),
             self.config.encoding_size,
             self.config.hidden_size,
         ).get_weights()
+
         self.config.results_path = (
             Path(self.config.results_path)
             / (self.game_name + "_summary")
@@ -88,12 +88,12 @@ class MuZero:
                 target=self_play.SelfPlay,
                 args=(
                     copy.deepcopy(self.muzero_weights),
-                    self.Game(self.config.seed + seed),
+                    self.Game(self.config.seed + seed, i),
                     self.config,
                 ),
                 kwargs={"idx": seed, "test": False},
             )
-            for seed in range(self.config.num_actors)
+            for i,seed in enumerate(range(self.config.num_actors))
         ]
         [p.start() for p in self_play_workers]
         test_worker = mp.Process(
@@ -151,8 +151,9 @@ class MuZero:
 
 
 if __name__ == "__main__":
-    muzero = MuZero("cartpole")
+    zero = MuZero('bpp')
+    # zero = MuZero('connect4')
+    muzero = zero
     muzero.train()
-
     muzero.load_model()
     muzero.test()
